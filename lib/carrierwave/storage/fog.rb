@@ -60,6 +60,14 @@ module CarrierWave
         def connection_cache
           @connection_cache ||= {}
         end
+
+        def eager_load
+          # see #1198. This will hopefully no longer be necessary in future release of fog
+          fog_credentials = CarrierWave::Uploader::Base.fog_credentials
+          if fog_credentials.present?
+            CarrierWave::Storage::Fog.connection_cache[fog_credentials] ||= ::Fog::Storage.new(fog_credentials)
+          end
+        end
       end
 
       ##
@@ -138,8 +146,8 @@ module CarrierWave
           :key    => uploader.fog_directory,
           :public => uploader.fog_public
         ).files.all(:prefix => uploader.cache_dir).each do |file|
-          # generate_cache_id returns key formated TIMEINT-PID-COUNTER-RND
-          time = file.key.scan(/(\d+)-\d+-\d+-\d+/).first.map { |t| t.to_i }
+          # generate_cache_id returns key formated TIMEINT-PID(-COUNTER)-RND
+          time = file.key.scan(/(\d+)-\d+-\d+(?:-\d+)?/).first.map { |t| t.to_i }
           time = Time.at(*time)
           file.destroy if time < (Time.now.utc - seconds)
         end
@@ -153,6 +161,8 @@ module CarrierWave
       end
 
       class File
+        DEFAULT_S3_REGION = 'us-east-1'
+
         include CarrierWave::Utilities::Uri
 
         ##
@@ -177,7 +187,7 @@ module CarrierWave
 
         ##
         # Return a temporary authenticated url to a private file, if available
-        # Only supported for AWS, Rackspace and Google providers
+        # Only supported for AWS, Rackspace, Google, AzureRM and Aliyun providers
         #
         # === Returns
         #
@@ -186,18 +196,25 @@ module CarrierWave
         # [NilClass] no authenticated url available
         #
         def authenticated_url(options = {})
-          if ['AWS', 'Google', 'Rackspace', 'OpenStack'].include?(@uploader.fog_credentials[:provider])
+          if ['AWS', 'Google', 'Rackspace', 'OpenStack', 'AzureRM', 'Aliyun', 'backblaze'].include?(@uploader.fog_credentials[:provider])
             # avoid a get by using local references
             local_directory = connection.directories.new(:key => @uploader.fog_directory)
             local_file = local_directory.files.new(:key => path)
-            expire_at = ::Fog::Time.now + @uploader.fog_authenticated_url_expiration
+            expire_at = options[:expire_at] || ::Fog::Time.now + @uploader.fog_authenticated_url_expiration
             case @uploader.fog_credentials[:provider]
-              when 'AWS'
-                local_file.url(expire_at, options)
-              when 'Rackspace'
+              when 'AWS', 'Google'
+                # Older versions of fog-google do not support options as a parameter
+                if url_options_supported?(local_file)
+                  local_file.url(expire_at, options)
+                else
+                  warn "Options hash not supported in #{local_file.class}. You may need to upgrade your Fog provider."
+                  local_file.url(expire_at)
+                end
+              when 'Rackspace', 'OpenStack'
                 connection.get_object_https_url(@uploader.fog_directory, path, expire_at, options)
-              when 'OpenStack'
-                connection.get_object_https_url(@uploader.fog_directory, path, expire_at)
+              when 'Aliyun'
+                expire_at = expire_at - Time.now
+                local_file.url(expire_at)
               else
                 local_file.url(expire_at)
             end
@@ -212,7 +229,7 @@ module CarrierWave
         # [String] value of content-type
         #
         def content_type
-          @content_type || !file.nil? && file.content_type
+          @content_type || file.try(:content_type)
         end
 
         ##
@@ -235,7 +252,9 @@ module CarrierWave
         #
         def delete
           # avoid a get by just using local reference
-          directory.files.new(:key => path).destroy
+          directory.files.new(:key => path).destroy.tap do |result|
+            @file = nil if result
+          end
         end
 
         ##
@@ -352,20 +371,30 @@ module CarrierWave
             end
           else
             # AWS/Google optimized for speed over correctness
-            case @uploader.fog_credentials[:provider].to_s
+            case fog_provider
             when 'AWS'
               # check if some endpoint is set in fog_credentials
               if @uploader.fog_credentials.has_key?(:endpoint)
                 "#{@uploader.fog_credentials[:endpoint]}/#{@uploader.fog_directory}/#{encoded_path}"
               else
                 protocol = @uploader.fog_use_ssl_for_aws ? "https" : "http"
+
+                subdomain_regex = /^(?:[a-z]|\d(?!\d{0,2}(?:\d{1,3}){3}$))(?:[a-z0-9\.]|(?![\-])|\-(?![\.])){1,61}[a-z0-9]$/
+                valid_subdomain = @uploader.fog_directory.to_s =~ subdomain_regex && !(protocol == 'https' && @uploader.fog_directory =~ /\./)
+
                 # if directory is a valid subdomain, use that style for access
-                if @uploader.fog_directory.to_s =~ /^(?:[a-z]|\d(?!\d{0,2}(?:\d{1,3}){3}$))(?:[a-z0-9\.]|(?![\-])|\-(?![\.])){1,61}[a-z0-9]$/
+                if valid_subdomain
                   s3_subdomain = @uploader.fog_aws_accelerate ? "s3-accelerate" : "s3"
                   "#{protocol}://#{@uploader.fog_directory}.#{s3_subdomain}.amazonaws.com/#{encoded_path}"
-                else
-                  # directory is not a valid subdomain, so use path style for access
-                  "#{protocol}://s3.amazonaws.com/#{@uploader.fog_directory}/#{encoded_path}"
+                else # directory is not a valid subdomain, so use path style for access
+                  region = @uploader.fog_credentials[:region].to_s
+                  host   = case region
+                           when DEFAULT_S3_REGION, ''
+                             's3.amazonaws.com'
+                           else
+                             "s3.#{region}.amazonaws.com"
+                           end
+                  "#{protocol}://#{host}/#{@uploader.fog_directory}/#{encoded_path}"
                 end
               end
             when 'Google'
@@ -466,7 +495,15 @@ module CarrierWave
         end
 
         def acl_header
-          {'x-amz-acl' => @uploader.fog_public ? 'public-read' : 'private'}
+          if fog_provider == 'AWS'
+            { 'x-amz-acl' => @uploader.fog_public ? 'public-read' : 'private' }
+          else
+            {}
+          end
+        end
+
+        def fog_provider
+          @uploader.fog_credentials[:provider].to_s
         end
 
         def read_source_file(file_body)
@@ -478,6 +515,11 @@ module CarrierWave
           ensure
             file_body.close
           end
+        end
+
+        def url_options_supported?(local_file)
+          parameters = local_file.method(:url).parameters
+          parameters.count == 2 && parameters[1].include?(:options)
         end
       end
 

@@ -1,3 +1,5 @@
+require 'carrierwave/downloader/base'
+
 module CarrierWave
 
   module Uploader
@@ -21,9 +23,10 @@ module CarrierWave
         add_config :move_to_cache
         add_config :move_to_store
         add_config :remove_previously_stored_files_after_update
+        add_config :downloader
 
         # fog
-        add_config :fog_provider
+        add_deprecated_config :fog_provider
         add_config :fog_attributes
         add_config :fog_credentials
         add_config :fog_directory
@@ -107,8 +110,8 @@ module CarrierWave
         #     cache_storage CarrierWave::Storage::File
         #     cache_storage MyCustomStorageEngine
         #
-        def cache_storage(storage = nil)
-          if storage
+        def cache_storage(storage = false)
+          unless storage == false
             self._cache_storage = storage.is_a?(Symbol) ? eval(storage_engines[storage]) : storage
           end
           _cache_storage
@@ -119,16 +122,8 @@ module CarrierWave
           class_eval <<-RUBY, __FILE__, __LINE__ + 1
             @#{name} = nil
 
-            def self.eager_load_fog(fog_credentials)
-              # see #1198. This will hopefully no longer be necessary after fog 2.0
-              require self.fog_provider
-              require 'carrierwave/storage/fog'
-              Fog::Storage.new(fog_credentials) if fog_credentials.present?
-            end unless defined? eager_load_fog
-
             def self.#{name}(value=nil)
               @#{name} = value if value
-              eager_load_fog(value) if value && '#{name}' == 'fog_credentials'
               return @#{name} if self.object_id == #{self.object_id} || defined?(@#{name})
               name = superclass.#{name}
               return nil if name.nil? && !instance_variable_defined?(:@#{name})
@@ -136,12 +131,10 @@ module CarrierWave
             end
 
             def self.#{name}=(value)
-              eager_load_fog(value) if '#{name}' == 'fog_credentials' && value.present?
               @#{name} = value
             end
 
             def #{name}=(value)
-              self.class.eager_load_fog(value) if '#{name}' == 'fog_credentials' && value.present?
               @#{name} = value
             end
 
@@ -153,6 +146,26 @@ module CarrierWave
               else
                 value
               end
+            end
+          RUBY
+        end
+
+        def add_deprecated_config(name)
+          class_eval <<-RUBY, __FILE__, __LINE__ + 1
+            def self.#{name}(value=nil)
+              ActiveSupport::Deprecation.warn "##{name} is deprecated and has no effect"
+            end
+
+            def self.#{name}=(value)
+              ActiveSupport::Deprecation.warn "##{name} is deprecated and has no effect"
+            end
+
+            def #{name}=(value)
+              ActiveSupport::Deprecation.warn "##{name} is deprecated and has no effect"
+            end
+
+            def #{name}
+              ActiveSupport::Deprecation.warn "##{name} is deprecated and has no effect"
             end
           RUBY
         end
@@ -173,8 +186,7 @@ module CarrierWave
               :fog  => "CarrierWave::Storage::Fog"
             }
             config.storage = :file
-            config.cache_storage = :file
-            config.fog_provider = 'fog'
+            config.cache_storage = nil
             config.fog_attributes = {}
             config.fog_credentials = {}
             config.fog_public = true
@@ -187,6 +199,7 @@ module CarrierWave
             config.move_to_cache = false
             config.move_to_store = false
             config.remove_previously_stored_files_after_update = true
+            config.downloader = CarrierWave::Downloader::Base
             config.ignore_integrity_errors = true
             config.ignore_processing_errors = true
             config.ignore_download_errors = true

@@ -1,3 +1,5 @@
+require 'securerandom'
+
 module CarrierWave
 
   class FormNotMultipart < UploadError
@@ -23,9 +25,9 @@ module CarrierWave
   #
   def self.generate_cache_id
     [Time.now.utc.to_i,
-      Process.pid,
-      '%04d' % (CarrierWave::CacheCounter.increment % 1000),
-      '%04d' % rand(9999)
+      SecureRandom.random_number(1_000_000_000_000_000),
+      '%04d' % (CarrierWave::CacheCounter.increment % 10_000),
+      '%04d' % SecureRandom.random_number(10_000)
     ].map(&:to_s).join('-')
   end
 
@@ -35,6 +37,16 @@ module CarrierWave
 
       include CarrierWave::Uploader::Callbacks
       include CarrierWave::Uploader::Configuration
+
+      included do
+        prepend Module.new {
+          def initialize(*)
+            super
+            @staged = false
+          end
+        }
+        attr_accessor :staged
+      end
 
       module ClassMethods
 
@@ -52,7 +64,7 @@ module CarrierWave
         # It's recommended that you keep cache files in one place only.
         #
         def clean_cached_files!(seconds=60*60*24)
-          cache_storage.new(CarrierWave::Uploader::Base.new).clean_cache!(seconds)
+          (cache_storage || storage).new(CarrierWave::Uploader::Base.new).clean_cache!(seconds)
         end
       end
 
@@ -78,14 +90,8 @@ module CarrierWave
       end
 
       def sanitized_file
-        _content = file.read
-        if _content.is_a?(File) # could be if storage is Fog
-          sanitized = CarrierWave::Storage::Fog.new(self).retrieve!(File.basename(_content.path))
-        else
-          sanitized = SanitizedFile.new :tempfile => StringIO.new(_content),
-            :filename => File.basename(path), :content_type => file.content_type
-        end
-        sanitized
+        ActiveSupport::Deprecation.warn('#sanitized_file is deprecated, use #file instead.')
+        file
       end
 
       ##
@@ -96,7 +102,7 @@ module CarrierWave
       # [String] a cache name, in the format TIMEINT-PID-COUNTER-RND/filename.txt
       #
       def cache_name
-        File.join(cache_id, full_original_filename) if cache_id and original_filename
+        File.join(cache_id, full_original_filename) if cache_id && original_filename
       end
 
       ##
@@ -115,7 +121,7 @@ module CarrierWave
       #
       # [CarrierWave::FormNotMultipart] if the assigned parameter is a string
       #
-      def cache!(new_file = sanitized_file)
+      def cache!(new_file = file)
         new_file = CarrierWave::SanitizedFile.new(new_file)
         return if new_file.empty?
 
@@ -123,6 +129,7 @@ module CarrierWave
 
         self.cache_id = CarrierWave.generate_cache_id unless cache_id
 
+        @staged = true
         @filename = new_file.filename
         self.original_filename = new_file.filename
 
@@ -156,6 +163,7 @@ module CarrierWave
       def retrieve_from_cache!(cache_name)
         with_callbacks(:retrieve_from_cache, cache_name) do
           self.cache_id, self.original_filename = cache_name.to_s.split('/', 2)
+          @staged = true
           @filename = original_filename
           @file = cache_storage.retrieve_from_cache!(full_filename(original_filename))
         end
@@ -200,7 +208,7 @@ module CarrierWave
       end
 
       def cache_storage
-        @cache_storage ||= self.class.cache_storage.new(self)
+        @cache_storage ||= (self.class.cache_storage || self.class.storage).new(self)
       end
     end # Cache
   end # Uploader

@@ -1,12 +1,7 @@
 require 'pathname'
 require 'active_support/core_ext/string/multibyte'
-
-begin
-  # Use mime/types/columnar if available, for reduced memory usage
-  require 'mime/types/columnar'
-rescue LoadError
-  require 'mime/types'
-end
+require 'mini_mime'
+require 'mimemagic'
 
 module CarrierWave
 
@@ -114,12 +109,11 @@ module CarrierWave
     # [String, nil] the path where the file is located.
     #
     def path
-      unless @file.blank?
-        if is_path?
-          File.expand_path(@file)
-        elsif @file.respond_to?(:path) and not @file.path.blank?
-          File.expand_path(@file.path)
-        end
+      return if @file.blank?
+      if is_path?
+        File.expand_path(@file)
+      elsif @file.respond_to?(:path) && !@file.path.blank?
+        File.expand_path(@file.path)
       end
     end
 
@@ -265,12 +259,10 @@ module CarrierWave
     # [String] the content type of the file
     #
     def content_type
-      return @content_type if @content_type
-      if @file.respond_to?(:content_type) and @file.content_type
-        @content_type = @file.content_type.to_s.chomp
-      elsif path
-        @content_type = ::MIME::Types.type_for(path).first.to_s
-      end
+      @content_type ||=
+        existing_content_type ||
+        mime_magic_content_type ||
+        mini_mime_content_type
     end
 
     ##
@@ -313,7 +305,7 @@ module CarrierWave
     def mkdir!(path, directory_permissions)
       options = {}
       options[:mode] = directory_permissions if directory_permissions
-      FileUtils.mkdir_p(File.dirname(path), options) unless File.exist?(File.dirname(path))
+      FileUtils.mkdir_p(File.dirname(path), **options) unless File.exist?(File.dirname(path))
     end
 
     def chmod!(path, permissions)
@@ -326,8 +318,30 @@ module CarrierWave
       name = File.basename(name)
       name = name.gsub(sanitize_regexp,"_")
       name = "_#{name}" if name =~ /\A\.+\z/
-      name = "unnamed" if name.size == 0
+      name = "unnamed" if name.size.zero?
       return name.mb_chars.to_s
+    end
+
+    def existing_content_type
+      if @file.respond_to?(:content_type) && @file.content_type
+        @file.content_type.to_s.chomp
+      end
+    end
+
+    def mime_magic_content_type
+      if path
+        File.open(path) do |file|
+          MimeMagic.by_magic(file).try(:type) || 'invalid/invalid'
+        end
+      end
+    rescue Errno::ENOENT
+      nil
+    end
+
+    def mini_mime_content_type
+      return unless path
+      mime_type = ::MiniMime.lookup_by_filename(path)
+      @content_type = (mime_type && mime_type.content_type).to_s
     end
 
     def split_extension(filename)

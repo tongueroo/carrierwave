@@ -3,9 +3,9 @@ def fog_tests(fog_credentials)
     shared_examples_for "#{fog_credentials[:provider]} storage" do
 
       before do
+        WebMock.disable! unless Fog.mocking?
         CarrierWave.configure do |config|
           config.reset_config
-          config.fog_provider = "fog/#{fog_credentials[:provider].downcase}"
           config.fog_attributes = {}
           config.fog_credentials = fog_credentials
           config.fog_directory = CARRIERWAVE_DIRECTORY
@@ -34,6 +34,7 @@ end
         CarrierWave.configure do |config|
           config.reset_config
         end
+        WebMock.enable! unless Fog.mocking?
       end
 
       describe '#cache_stored_file!' do
@@ -41,6 +42,40 @@ end
           uploader = @uploader.new
           uploader.store!(file)
           expect { uploader.cache_stored_file! }.not_to raise_error
+        end
+
+        it "should create local file for processing" do
+          @uploader.class_eval do
+            def check_file
+              raise unless File.exists?(file.path)
+            end
+            process :check_file
+          end
+          uploader = @uploader.new
+          uploader.store!(file)
+          uploader.cache_stored_file!
+        end
+      end
+
+      context '#acl_header' do
+        let(:store_path) { 'uploads/test+.jpg' }
+
+        before do
+          allow(@uploader).to receive(:store_path).and_return(store_path)
+        end
+
+        it 'includes acl_header when necessary' do
+          if file.is_a?(CarrierWave::Storage::Fog::File)
+            if @provider == 'AWS'
+              expect(@storage.connection).to receive(:copy_object)
+                                              .with(anything, anything, anything, anything, { "x-amz-acl"=>"public-read" }).and_call_original
+            else
+              expect(@storage.connection).to receive(:copy_object)
+                                              .with(anything, anything, anything, anything, {}).and_call_original
+            end
+          end
+
+          @storage.store!(file)
         end
       end
 
@@ -88,19 +123,19 @@ end
 
             context "directory is a valid subdomain" do
               before do
-                allow(@uploader).to receive(:fog_directory).and_return('assets.site.com')
+                allow(@uploader).to receive(:fog_directory).and_return('assets-site-com')
               end
 
               it "should use a subdomain URL for AWS" do
                 if @provider == 'AWS'
-                  expect(@fog_file.public_url).to include('https://assets.site.com.s3.amazonaws.com')
+                  expect(@fog_file.public_url).to include('https://assets-site-com.s3.amazonaws.com')
                 end
               end
 
               it "should use accelerate domain if fog_aws_accelerate is true" do
                 if @provider == 'AWS'
                   allow(@uploader).to receive(:fog_aws_accelerate).and_return(true)
-                  expect(@fog_file.public_url).to include('https://assets.site.com.s3-accelerate.amazonaws.com')
+                  expect(@fog_file.public_url).to include('https://assets-site-com.s3-accelerate.amazonaws.com')
                 end
               end
             end
@@ -109,6 +144,40 @@ end
               if @provider == 'AWS'
                 allow(@uploader).to receive(:fog_directory).and_return('SiteAssets')
                 expect(@fog_file.public_url).to include('https://s3.amazonaws.com/SiteAssets')
+              end
+            end
+
+            it "should not use a subdomain URL for AWS if https && the directory is not accessible over https as a virtual hosted bucket" do
+              if @provider == 'AWS'
+                allow(@uploader).to receive(:fog_use_ssl_for_aws).and_return(true)
+                allow(@uploader).to receive(:fog_directory).and_return('foo.bar')
+                expect(@fog_file.public_url).to include('https://s3.amazonaws.com/foo.bar')
+              end
+            end
+
+            it "should use a subdomain URL for AWS if http && the directory is not accessible over https as a virtual hosted bucket" do
+              if @provider == 'AWS'
+                allow(@uploader).to receive(:fog_use_ssl_for_aws).and_return(false)
+                allow(@uploader).to receive(:fog_directory).and_return('foo.bar')
+                expect(@fog_file.public_url).to include('http://foo.bar.s3.amazonaws.com/')
+              end
+            end
+
+            {
+              nil            => 's3.amazonaws.com',
+              'us-east-1'    => 's3.amazonaws.com',
+              'us-east-2'    => 's3.us-east-2.amazonaws.com',
+              'eu-central-1' => 's3.eu-central-1.amazonaws.com'
+            }.each do |region, expected_host|
+              it "should use a #{expected_host} hostname when using path style for access #{region} region" do
+                if @provider == 'AWS'
+                  allow(@uploader).to receive(:fog_use_ssl_for_aws).and_return(true)
+                  allow(@uploader).to receive(:fog_directory).and_return('foo.bar')
+
+                  allow(@uploader).to receive(:fog_credentials).and_return(@uploader.fog_credentials.merge(region: region))
+
+                  expect(@fog_file.public_url).to include("https://#{expected_host}/foo.bar")
+                end
               end
             end
 
@@ -214,6 +283,14 @@ end
             it "should not error getting the content type" do
               expect { @fog_file.content_type }.not_to raise_error
             end
+
+            it "should not return false for content type" do
+              expect(@fog_file.content_type).not_to be false
+            end
+
+            it "should let #exists? be false" do
+              expect(@fog_file.exists?).to be false
+            end
           end
         end
 
@@ -305,7 +382,7 @@ end
       end
 
       describe '#clean_cache!' do
-        let(:today) { '2016/10/09 10:00:00'.to_time }
+        let(:today) { Time.now.round }
         let(:five_days_ago) { today.ago(5.days) }
         let(:three_days_ago) { today.ago(3.days) }
         let(:yesterday) { today.yesterday }
@@ -348,6 +425,14 @@ end
             CarrierWave.clean_cached_files!
           end
           expect(@directory.files.all(:prefix => 'uploads/tmp').size).to eq(2)
+        end
+
+        it "cleans a directory named using old format of cache id" do
+          @directory.files.create(:key => "uploads/tmp/#{yesterday.utc.to_i}-100-1234/test.jpg", :body => 'A test, 1234', :public => true)
+          Timecop.freeze(today) do
+            @uploader.clean_cached_files!(0)
+          end
+          expect(@directory.files.all(:prefix => 'uploads/tmp').size).to eq(0)
         end
       end
 
@@ -393,13 +478,24 @@ end
 
           it "should not be available at public URL" do
             unless Fog.mocking? || fog_credentials[:provider] == 'Local'
-              expect(running{ open(@fog_file.public_url) }).to raise_error
+              expect(running{ open(@fog_file.public_url) }).to raise_error OpenURI::HTTPError
             end
           end
 
           it "should have an authenticated_url" do
-            if ['AWS', 'Rackspace', 'Google', 'OpenStack'].include?(@provider)
+            if ['AWS', 'Rackspace', 'Google', 'OpenStack', 'AzureRM', 'Aliyun', 'backblaze'].include?(@provider)
               expect(@fog_file.authenticated_url).not_to be_nil
+            end
+          end
+
+          it "should have an custom authenticated_url" do
+            if ['AWS', 'Rackspace', 'Google', 'OpenStack', 'AzureRM'].include?(@provider)
+              timestamp = ::Fog::Time.now + 999
+              if @provider == "AWS"
+                expect(@fog_file.authenticated_url({expire_at: timestamp })).to include("Expires=999&")
+              elsif @provider == "Google"
+                expect(@fog_file.authenticated_url({expire_at: timestamp })).to include("Expires=#{timestamp.to_i}")
+              end
             end
           end
 
@@ -408,9 +504,24 @@ end
           end
 
           it "should handle query params" do
-            if @provider == 'AWS' && !Fog.mocking?
-              headers = Excon.get(@fog_file.url(:query => {"response-content-disposition" => "attachment"})).headers
-              expect(headers["Content-Disposition"]).to eq("attachment")
+            if ['AWS', 'Google'].include?(@provider)
+              url = @fog_file.url(:query => {"response-content-disposition" => "attachment"})
+              expect(url).to match(/response-content-disposition=attachment/)
+              unless Fog.mocking?
+                # Workaround for S3 SignatureDoesNotMatch issue
+                #   https://github.com/excon/excon/issues/475
+                Excon.defaults[:omit_default_port] = true
+                response = Excon.get(url)
+                expect(response.status).to be 200
+                expect(response.headers["Content-Disposition"]).to eq("attachment")
+              end
+            end
+          end
+
+          it "should not use #file to get signed url" do
+            if ['AWS', 'Google'].include?(@provider)
+              allow(@fog_file).to receive(:file).and_return(nil)
+              expect { @fog_file.url }.not_to raise_error
             end
           end
         end

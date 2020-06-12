@@ -164,6 +164,30 @@ describe CarrierWave::ActiveRecord do
 
         expect(@event.reload.image).to be_blank
       end
+
+      context "with CarrierWave::MiniMagick" do
+        before(:each) do
+          @uploader.send(:include, CarrierWave::MiniMagick)
+        end
+
+        it "has width and height" do
+          @event.image = stub_file('landscape.jpg')
+          expect(@event.image.width).to eq 640
+          expect(@event.image.height).to eq 480
+        end
+      end
+
+      context "with CarrierWave::RMagick", :rmagick => true do
+        before(:each) do
+          @uploader.send(:include, CarrierWave::RMagick)
+        end
+
+        it "has width and height" do
+          @event.image = stub_file('landscape.jpg')
+          expect(@event.image.width).to eq 640
+          expect(@event.image.height).to eq 480
+        end
+      end
     end
 
     describe '#image=' do
@@ -648,7 +672,7 @@ describe CarrierWave::ActiveRecord do
     end
 
     after do
-      FileUtils.rm_rf(file_path("uploads"))
+      FileUtils.rm_rf(public_path("uploads"))
     end
 
     describe 'normally' do
@@ -681,7 +705,7 @@ describe CarrierWave::ActiveRecord do
         expect(File.exist?(public_path('uploads/old.jpeg'))).to be_truthy
       end
 
-      pending("should only delete the file once when the file is removed") do
+      it "should only delete the file once when the file is removed" do
         @event.remove_image = true
         expect_any_instance_of(CarrierWave::SanitizedFile).to receive(:delete).exactly(1).times
         expect(@event.save).to be_truthy
@@ -733,7 +757,7 @@ describe CarrierWave::ActiveRecord do
     end
 
     after do
-      FileUtils.rm_rf(file_path("uploads"))
+      FileUtils.rm_rf(public_path("uploads"))
     end
 
     it "should remove old file if old file had a different path" do
@@ -756,10 +780,48 @@ describe CarrierWave::ActiveRecord do
       Event.transaction do
         @event.image = stub_file('new.jpeg')
         @event.save
-        expect(File.exist?(public_path('uploads/new.jpeg'))).to be_truthy
         expect(File.exist?(public_path('uploads/old.jpeg'))).to be_truthy
         raise ActiveRecord::Rollback
       end
+      expect(File.exist?(public_path('uploads/old.jpeg'))).to be_truthy
+    end
+  end
+
+  describe "#mount_uploader into transaction" do
+    before do
+      @uploader.version :thumb
+      reset_class("Event")
+      Event.mount_uploader(:image, @uploader)
+      @event = Event.new
+    end
+
+    after do
+      FileUtils.rm_rf(public_path("uploads"))
+    end
+
+    it "should not store file during rollback" do
+      Event.transaction do
+        @event.image = stub_file('new.jpeg')
+        @event.save
+
+        raise ActiveRecord::Rollback
+      end
+
+      expect(File.exist?(public_path('uploads/new.jpeg'))).to be_falsey
+    end
+
+    it "should not change file during rollback" do
+      @event.image = stub_file('old.jpeg')
+      @event.save
+
+      Event.transaction do
+        @event.image = stub_file('new.jpeg')
+        @event.save
+
+        raise ActiveRecord::Rollback
+      end
+
+      expect(File.exist?(public_path('uploads/new.jpeg'))).to be_falsey
       expect(File.exist?(public_path('uploads/old.jpeg'))).to be_truthy
     end
   end
@@ -781,7 +843,7 @@ describe CarrierWave::ActiveRecord do
     end
 
     after do
-      FileUtils.rm_rf(file_path("uploads"))
+      FileUtils.rm_rf(public_path("uploads"))
     end
 
     it "should remove old file1 and file2 if old file1 and file2 had a different paths" do
@@ -824,7 +886,7 @@ describe CarrierWave::ActiveRecord do
     end
 
     after do
-      FileUtils.rm_rf(file_path("uploads"))
+      FileUtils.rm_rf(public_path("uploads"))
     end
 
     it "should remove old file if old file had a different path" do
@@ -1187,6 +1249,13 @@ describe CarrierWave::ActiveRecord do
         @event.remove_images = "1"
         expect(@event.images_changed?).to be_truthy
       end
+
+      it "should not mark the images as changed if falsey value is assigned" do
+        @event.remove_images = "0"
+        expect(@event.images_changed?).to be_falsey
+        @event.remove_images = "false"
+        expect(@event.images_changed?).to be_falsey
+      end
     end
 
     describe "#remote_images_urls=" do
@@ -1365,7 +1434,7 @@ describe CarrierWave::ActiveRecord do
     end
 
     after do
-      FileUtils.rm_rf(file_path("uploads"))
+      FileUtils.rm_rf(public_path("uploads"))
     end
 
     describe 'normally' do
@@ -1442,7 +1511,7 @@ describe CarrierWave::ActiveRecord do
     end
 
     after do
-      FileUtils.rm_rf(file_path("uploads"))
+      FileUtils.rm_rf(public_path("uploads"))
     end
 
     it "should remove old file if old file had a different path" do
@@ -1479,7 +1548,7 @@ describe CarrierWave::ActiveRecord do
     end
 
     after do
-      FileUtils.rm_rf(file_path("uploads"))
+      FileUtils.rm_rf(public_path("uploads"))
     end
 
     it "should remove old file1 and file2 if old file1 and file2 had a different paths" do
@@ -1521,7 +1590,7 @@ describe CarrierWave::ActiveRecord do
     end
 
     after do
-      FileUtils.rm_rf(file_path("uploads"))
+      FileUtils.rm_rf(public_path("uploads"))
     end
 
     it "should remove old file if old file had a different path" do
@@ -1542,13 +1611,53 @@ describe CarrierWave::ActiveRecord do
     end
   end
 
-  describe "#dup" do
-    it "appropriately removes the model reference from the new models uploader" do
+  describe '#reload' do
+    before do
       Event.mount_uploader(:image, @uploader)
+    end
+
+    context 'when #reload is overriden in the model' do
+      before do
+        Event.class_eval do
+          def reload(*)
+            super
+          end
+        end
+        @event.save
+        @event.image
+      end
+
+      it "clears @_mounters" do
+        expect { @event.reload }.to change { @event.instance_variable_get(:@_mounters) }.to(nil)
+      end
+    end
+  end
+
+  describe "#dup" do
+    before do
+      Event.mount_uploader(:image, @uploader)
+    end
+
+    it "appropriately removes the model reference from the new models uploader" do
       @event.save
       new_event = @event.dup
 
       expect(new_event.image.model).not_to eq @event
+    end
+
+    context 'when #initialize_dup is overriden in the model' do
+      before do
+        Event.class_eval do
+          def initialize_dup(*)
+            super
+          end
+        end
+        @event.image
+      end
+
+      it "clears @_mounters" do
+        expect(@event.dup.instance_variable_get(:@_mounters)).to be_blank
+      end
     end
   end
 end

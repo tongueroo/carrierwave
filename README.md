@@ -30,13 +30,13 @@ $ gem install carrierwave
 In Rails, add it to your Gemfile:
 
 ```ruby
-gem 'carrierwave', '~> 1.0'
+gem 'carrierwave', '~> 2.0'
 ```
 
 Finally, restart the server to apply the changes.
 
-As of version 1.0, CarrierWave requires Rails 4.0 or higher and Ruby 2.0
-or higher. If you're on Rails 3, you should use v0.11.0.
+As of version 2.0, CarrierWave requires Rails 5.0 or higher and Ruby 2.2
+or higher. If you're on Rails 4, you should use 1.x.
 
 ## Getting Started
 
@@ -89,7 +89,7 @@ a migration:
 
 
 	rails g migration add_avatar_to_users avatar:string
-	rake db:migrate
+	rails db:migrate
 
 Open your model file and mount the uploader:
 
@@ -144,12 +144,12 @@ example, create a migration like this:
 #### For databases with ActiveRecord json data type support (e.g. PostgreSQL, MySQL)
 
 	rails g migration add_avatars_to_users avatars:json
-	rake db:migrate
+	rails db:migrate
 
 #### For database without ActiveRecord json data type support (e.g. SQLite)
 
 	rails g migration add_avatars_to_users avatars:string
-	rake db:migrate
+	rails db:migrate
 
 __Note__: JSON datatype doesn't exists in SQLite adapter, that's why you can use a string datatype which will be serialized in model.
 
@@ -162,6 +162,9 @@ class User < ActiveRecord::Base
   serialize :avatars, JSON # If you use SQLite, add this line.
 end
 ```
+
+Make sure that you mount the uploader with write (mount_uploaders) with `s` not (mount_uploader)
+in order to avoid errors when uploading multiple files
 
 Make sure your file input fields are set up as multiple file fields. For
 example in Rails you'll want to do something like this:
@@ -186,6 +189,17 @@ u.avatars[0].url # => '/url/to/file.png'
 u.avatars[0].current_path # => 'path/to/file.png'
 u.avatars[0].identifier # => 'file.png'
 ```
+
+If you want to preserve existing files on uploading new one, you can go like:
+
+```erb
+<% user.avatars.each do |avatar| %>
+  <%= hidden_field :user, :avatars, multiple: true, value: avatar.identifier %>
+<% end %>
+<%= form.file_field :avatars, multiple: true %>
+```
+
+Sorting avatars is supported as well by reordering `hidden_field`, an example using jQuery UI Sortable is available [here](https://github.com/carrierwaveuploader/carrierwave/wiki/How-to%3A-Add%2C-remove-and-reorder-images-using-multiple-file-upload).
 
 ## Changing the storage directory
 
@@ -252,6 +266,22 @@ class NoJsonUploader < CarrierWave::Uploader::Base
 end
 ```
 
+### CVE-2016-3714 (ImageTragick)
+This version of CarrierWave has the ability to mitigate CVE-2016-3714. However, you **MUST** set a content_type_whitelist in your uploaders for this protection to be effective, and you **MUST** either disable ImageMagick's default SVG delegate or use the RSVG delegate for SVG processing.
+
+
+A valid whitelist that will restrict your uploader to images only, and mitigate the CVE is:
+
+```ruby
+class MyUploader < CarrierWave::Uploader::Base
+  def content_type_whitelist
+    [/image\//]
+  end
+end
+```
+
+**WARNING**: A `content_type_whitelist` is the only form of whitelist or blacklist supported by CarrierWave that can effectively mitigate against CVE-2016-3714. Use of `extension_whitelist` will not inspect the file headers, and thus still leaves your application open to the vulnerability.
+
 ### Filenames and unicode chars
 
 Another security issue you should care for is the file names (see
@@ -277,7 +307,7 @@ You no longer need to do this manually.
 
 Often you'll want to add different versions of the same file. The classic example is image thumbnails. There is built in support for this*:
 
-*Note:* You must have Imagemagick and MiniMagick installed to do image resizing. MiniMagick is a Ruby interface for Imagemagick which is a C program. This is why MiniMagick fails on 'bundle install' without Imagemagick installed.
+*Note:* You must have Imagemagick installed to do image resizing.
 
 Some documentation refers to RMagick instead of MiniMagick but MiniMagick is recommended.
 
@@ -302,15 +332,13 @@ end
 
 When this uploader is used, an uploaded image would be scaled to be no larger
 than 800 by 800 pixels. The original aspect ratio will be kept.
-A version called thumb is then created, which is scaled
-to exactly 200 by 200 pixels.
 
-If you would like to crop images to a specific height and width you
-can use the alternative option of '''resize_to_fill'''. It will make sure
+A version called `:thumb` is then created, which is scaled
+to exactly 200 by 200 pixels. The thumbnail uses `resize_to_fill` which makes sure
 that the width and height specified are filled, only cropping
 if the aspect ratio requires it.
 
-The uploader could be used like this:
+The above uploader could be used like this:
 
 ```ruby
 uploader = AvatarUploader.new
@@ -322,6 +350,18 @@ uploader.thumb.url # => '/url/to/thumb_my_file.png'   # size: 200x200
 
 One important thing to remember is that process is called *before* versions are
 created. This can cut down on processing cost.
+
+### Processing Methods: mini_magick
+
+- `convert` - Changes the image encoding format to the given format, eg. jpg
+- `resize_to_limit` - Resize the image to fit within the specified dimensions while retaining the original aspect ratio. Will only resize the image if it is larger than the specified dimensions. The resulting image may be shorter or narrower than specified in the smaller dimension but will not be larger than the specified values.
+- `resize_to_fit` - Resize the image to fit within the specified dimensions while retaining the original aspect ratio. The image may be shorter or narrower than specified in the smaller dimension but will not be larger than the specified values.
+- `resize_to_fill` - Resize the image to fit within the specified dimensions while retaining the aspect ratio of the original image. If necessary, crop the image in the larger dimension. Optionally, a "gravity" may be specified, for example "Center", or "NorthEast".
+- `resize_and_pad` - Resize the image to fit within the specified dimensions while retaining the original aspect ratio. If necessary, will pad the remaining area with the given color, which defaults to transparent (for gif and png, white for jpeg). Optionally, a "gravity" may be specified, as above.
+
+See `carrierwave/processing/mini_magick.rb` for details.
+
+### Nested versions
 
 It is possible to nest versions within versions:
 
@@ -359,7 +399,7 @@ private
   end
 
   def is_landscape? picture
-    image = MiniMagick::Image.open(picture.path)
+    image = MiniMagick::Image.new(picture.path)
     image[:width] > image[:height]
   end
 
@@ -648,7 +688,6 @@ If you want to use fog you must add in your CarrierWave initializer the
 following lines
 
 ```ruby
-config.fog_provider = 'fog' # 'fog/aws' etc. Defaults to 'fog'
 config.fog_credentials = { ... } # Provider specific credentials
 ```
 
@@ -666,7 +705,6 @@ You can also pass in additional options, as documented fully in lib/carrierwave/
 
 ```ruby
 CarrierWave.configure do |config|
-  config.fog_provider = 'fog/aws'                        # required
   config.fog_credentials = {
     provider:              'AWS',                        # required
     aws_access_key_id:     'xxx',                        # required unless using use_iam_profile
@@ -692,6 +730,14 @@ end
 
 That's it! You can still use the `CarrierWave::Uploader#url` method to return the url to the file on Amazon S3.
 
+**Note**: for Carrierwave to work properly it needs credentials with the following permissions:
+
+* `s3:ListBucket`
+* `s3:PutObject`
+* `s3:GetObject`
+* `s3:DeleteObject`
+* `s3:PutObjectAcl`
+
 ## Using Rackspace Cloud Files
 
 [Fog](http://github.com/fog/fog) is used to support Rackspace Cloud Files. Ensure you have it in your Gemfile:
@@ -707,7 +753,6 @@ Using a US-based account:
 
 ```ruby
 CarrierWave.configure do |config|
-  config.fog_provider = "fog/rackspace/storage"   # optional, defaults to "fog"
   config.fog_credentials = {
     provider:           'Rackspace',
     rackspace_username: 'xxxxxx',
@@ -722,7 +767,6 @@ Using a UK-based account:
 
 ```ruby
 CarrierWave.configure do |config|
-  config.fog_provider = "fog/rackspace/storage"   # optional, defaults to "fog"
   config.fog_credentials = {
     provider:           'Rackspace',
     rackspace_username: 'xxxxxx',
@@ -771,7 +815,6 @@ Please read the [fog-google README](https://github.com/fog/fog-google/blob/maste
 
 ```ruby
 CarrierWave.configure do |config|
-  config.fog_provider = 'fog/google'                        # required
   config.fog_credentials = {
     provider:                         'Google',
     google_storage_access_key_id:     'xxxxxx',
@@ -868,8 +911,8 @@ manipulation methods.
 
 ## Using MiniMagick
 
-MiniMagick is similar to RMagick but performs all the operations using the 'mogrify'
-command which is part of the standard ImageMagick kit. This allows you to have the power
+MiniMagick is similar to RMagick but performs all the operations using the 'convert'
+CLI which is part of the standard ImageMagick kit. This allows you to have the power
 of ImageMagick without having to worry about installing all the RMagick libraries.
 
 See the MiniMagick site for more details:
@@ -972,12 +1015,12 @@ end
 Will add these callbacks:
 
 ```ruby
-after_save :store_avatar!
 before_save :write_avatar_identifier
+after_save :store_previous_changes_for_avatar
 after_commit :remove_avatar!, on: :destroy
 after_commit :mark_remove_avatar_false, on: :update
-after_save :store_previous_changes_for_avatar
 after_commit :remove_previously_stored_avatar, on: :update
+after_commit :store_avatar!, on: [:create, :update]
 ```
 
 If you want to skip any of these callbacks (eg. you want to keep the existing

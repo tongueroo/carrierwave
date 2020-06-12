@@ -1,15 +1,12 @@
 require 'spec_helper'
 
-begin
-  # Use mime/types/columnar if available, for reduced memory usage
-  require 'mime/types/columnar'
-rescue LoadError
-  require 'mime/types'
-end
-
 describe CarrierWave::SanitizedFile do
   before do
     FileUtils.cp(file_path('test.jpg'), file_path('llama.jpg'))
+  end
+
+  after do
+    FileUtils.rm_rf(file_path("new_dir"))
   end
 
   after(:all) do
@@ -189,7 +186,8 @@ describe CarrierWave::SanitizedFile do
 
     it "handles Mime::Type object" do
       file = File.open(file_path('sponsored.doc'))
-      allow(file).to receive(:content_type).and_return(MIME::Type.new("application/msword"))
+      allow(file).to receive(:content_type) { 'application/msword' }
+
       sanitized_file = CarrierWave::SanitizedFile.new(file)
       allow(sanitized_file).to receive(:file).and_return(file)
 
@@ -201,6 +199,32 @@ describe CarrierWave::SanitizedFile do
       sanitized_file = CarrierWave::SanitizedFile.new("llama.jpg")
 
       expect(sanitized_file.content_type).to eq("image/jpeg")
+    end
+
+    it "does not allow spoofing of the mime type" do
+      file = File.open(file_path("zip.png"))
+
+      sanitized_file = CarrierWave::SanitizedFile.new(file)
+      expect { sanitized_file.content_type }.not_to raise_error
+
+      expect(sanitized_file.content_type).to eq("application/zip")
+    end
+
+    it "does not allow spoofing of the mime type if the mime type is not detectable" do
+      file = File.open(file_path('spoof.png'))
+
+      sanitized_file = CarrierWave::SanitizedFile.new(file)
+
+      expect { sanitized_file.content_type }.not_to raise_error
+
+      expect(sanitized_file.content_type).to_not eq 'image/png'
+      expect(sanitized_file.content_type).to eq 'invalid/invalid'
+    end
+
+    it "does not raise an error if the path is not present" do
+      sanitized_file = CarrierWave::SanitizedFile.new(nil)
+
+      expect { sanitized_file.content_type }.not_to raise_error
     end
   end
 
@@ -301,7 +325,6 @@ describe CarrierWave::SanitizedFile do
         sanitized_file.move_to(file_path("new_dir","gurr.png"), nil, 0775)
 
         expect(sanitized_file).to have_directory_permissions(0775)
-        FileUtils.rm_rf(file_path("new_dir"))
       end
 
       it "should return itself" do
@@ -395,7 +418,6 @@ describe CarrierWave::SanitizedFile do
         new_file = sanitized_file.copy_to(file_path("new_dir", "gurr.png"), nil, 0755)
 
         expect(new_file).to have_directory_permissions(0755)
-        FileUtils.rm_rf(file_path("new_dir"))
       end
 
       it "should preserve the file's content type" do

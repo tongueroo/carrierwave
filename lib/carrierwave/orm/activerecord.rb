@@ -12,7 +12,9 @@ module CarrierWave
     def mount_uploader(column, uploader=nil, options={}, &block)
       super
 
-      class_eval <<-RUBY, __FILE__, __LINE__+1
+      mod = Module.new
+      prepend mod
+      mod.class_eval <<-RUBY, __FILE__, __LINE__+1
         def remote_#{column}_url=(url)
           column = _mounter(:#{column}).serialization_column
           __send__(:"\#{column}_will_change!")
@@ -27,7 +29,9 @@ module CarrierWave
     def mount_uploaders(column, uploader=nil, options={}, &block)
       super
 
-      class_eval <<-RUBY, __FILE__, __LINE__+1
+      mod = Module.new
+      prepend mod
+      mod.class_eval <<-RUBY, __FILE__, __LINE__+1
         def remote_#{column}_urls=(url)
           column = _mounter(:#{column}).serialization_column
           __send__(:"\#{column}_will_change!")
@@ -52,15 +56,16 @@ module CarrierWave
       validates_processing_of column if uploader_option(column.to_sym, :validate_processing)
       validates_download_of column if uploader_option(column.to_sym, :validate_download)
 
-      after_save :"store_#{column}!"
       before_save :"write_#{column}_identifier"
+      after_save :"store_previous_changes_for_#{column}"
       after_commit :"remove_#{column}!", :on => :destroy
       after_commit :"mark_remove_#{column}_false", :on => :update
-
-      after_save :"store_previous_changes_for_#{column}"
       after_commit :"remove_previously_stored_#{column}", :on => :update
+      after_commit :"store_#{column}!", :on => [:create, :update]
 
-      class_eval <<-RUBY, __FILE__, __LINE__+1
+      mod = Module.new
+      prepend mod
+      mod.class_eval <<-RUBY, __FILE__, __LINE__+1
         def #{column}=(new_file)
           column = _mounter(:#{column}).serialization_column
           if !(new_file.blank? && __send__(:#{column}).blank?)
@@ -72,8 +77,9 @@ module CarrierWave
 
         def remove_#{column}=(value)
           column = _mounter(:#{column}).serialization_column
-          __send__(:"\#{column}_will_change!")
-          super
+          result = super
+          __send__(:"\#{column}_will_change!") if _mounter(:#{column}).remove?
+          result
         end
 
         def remove_#{column}!
